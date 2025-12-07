@@ -5,7 +5,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 import datetime
 import base64
-from scipy.optimize import linprog
+
 
 
 # =============================================================================
@@ -618,122 +618,162 @@ def compute_v2g_daily_cost(
     export_factor=1.0,
 ):
     """
-    V2G daily optimisation using scipy.optimize.linprog
-    Decision variables:
-        x = [e_ch[0..Q-1], e_dis[0..Q-1], soc[0..Q]]
+    Balanced, solver-free V2G optimiser (no pulp / scipy needed).
+
+    - 15-min resolution
+    - SoC-based (start %, target %, min %)
+    - Bidirectional: charge + discharge
+    - 'Balanced' behaviour:
+        * charges when prices are cheap or SoC is below target
+        * discharges when prices are high enough (spread > threshold)
+        * always respects SoC bounds and ability to reach target
+
+    Returns: total net cost for that day (€/day)
     """
 
-    import numpy as np
-
+    wholesale_q = np.array(wholesale_q, dtype=float)
+    grid_q = np.array(grid_q, dtype=float)
     Q = len(wholesale_q)
 
-    wholesale_kwh = np.array(wholesale_q) / 1000.0
-    grid_q = np.array(grid_q)
+    if len(grid_q) != Q:
+        raise ValueError("V2G: wholesale and grid arrays must have same length.")
 
-    # Price vectors
+    # Convert SoC to kWh
+    soc0 = battery_kwh * soc_start_pct / 100.0
+    soc_target = battery_kwh * soc_target_pct / 100.0
+    soc_min = battery_kwh * soc_min_pct / 100.0
+
+    if soc_start_pct < soc_min_pct:
+        raise ValueError("Arrival SoC (%) must be ≥ minimum SoC (%).")
+    if soc_target_pct < soc_min_pct:
+        raise ValueError("Target SoC (%) must be ≥ minimum SoC (%).")
+
+    # Prices in €/kWh
+    wholesale_kwh = wholesale_q / 1000.0
     import_price = apply_tariffs(wholesale_kwh, grid_q, taxes, vat)
     export_price = export_factor * wholesale_kwh
 
-    # Convert SoC inputs
-    soc0 = battery_kwh * soc_start_pct / 100
-    socT = battery_kwh * soc_target_pct / 100
-    soc_min = battery_kwh * soc_min_pct / 100
+    # Availability mask
+    quarters_set = set(quarters)
+    available_mask = np.array([t in quarters_set for t in range(Q)], dtype=bool)
+    available_indices = np.where(available_mask)[0]
+    n_avail = len(available_indices)
 
-    # Variable vector length:
-    # e_ch[0..Q-1], e_dis[0..Q-1], soc[0..Q]
-    n_vars = Q + Q + (Q + 1)
+    if n_avail == 0:
+        # No time to do anything → just hold SoC, cost 0
+        return 0.0
 
-    # Objective function coefficients
-    c = np.zeros(n_vars)
-
-    # e_ch part → positive cost (import)
-    for t in range(Q):
-        c[t] = import_price[t]
-
-    # e_dis part → negative cost (revenue)
-    for t in range(Q):
-        c[Q + t] = -export_price[t]
-
-    # soc variables → no direct cost
-    # (already zero)
-
-    # Bounds
-    bounds = []
-
-    # Charging limits
+    # Power → kWh per quarter
     emax_ch = p_charge_max * 0.25
     emax_dis = p_discharge_max * 0.25
-    quarters_set = set(quarters)
 
-    # e_ch bounds
+    # Feasibility check: can we reach soc_target at all?
+    max_extra_soc = eta_ch * emax_ch * n_avail
+    if soc_target - soc0 > max_extra_soc + 1e-6:
+        raise ValueError("V2G: impossible to reach target SoC with given window & power.")
+
+    # Precompute: number of future available slots from each t
+    future_slots = np.zeros(Q, dtype=int)
+    count = 0
+    for t in range(Q - 1, -1, -1):
+        if available_mask[t]:
+            count += 1
+        future_slots[t] = count
+
+    # Thresholds for "cheap" vs "expensive"
+    import_avail = import_price[available_mask]
+    cheap_threshold = np.quantile(import_avail, 0.3)  # lower 30% = cheap
+
+    # Profit spread threshold (balanced mode): ~0.5 ct/kWh
+    spread_threshold = 0.005  # €/kWh
+
+    # Decision arrays
+    e_ch = np.zeros(Q, dtype=float)
+    e_dis = np.zeros(Q, dtype=float)
+
+    soc = soc0
+
+    # ---------- FORWARD PASS: main heuristic ----------
     for t in range(Q):
-        if t in quarters_set:
-            bounds.append((0, emax_ch))
-        else:
-            bounds.append((0, 0))
+        if not available_mask[t]:
+            # No EV connected → nothing happens
+            continue
 
-    # e_dis bounds
-    for t in range(Q):
-        if t in quarters_set:
-            bounds.append((0, emax_dis))
-        else:
-            bounds.append((0, 0))
+        # How many slots left including t?
+        n_future = future_slots[t]
+        max_future_charge_soc = eta_ch * emax_ch * n_future
 
-    # SoC bounds
-    for t in range(Q + 1):
-        bounds.append((soc_min, battery_kwh))
+        # Small safety factor: assume we'll only manage ~90% of max future charge
+        max_future_charge_soc *= 0.9
 
-    # Constraints
-    A_eq = []
-    b_eq = []
+        # Minimum SoC we can safely go to and still reach target later
+        soc_min_allowed = max(soc_min, soc_target - max_future_charge_soc)
 
-    # Initial SoC constraint
-    row = np.zeros(n_vars)
-    soc_index_0 = 2 * Q + 0
-    row[soc_index_0] = 1
-    A_eq.append(row)
-    b_eq.append(soc0)
+        # Price signal
+        p_in = import_price[t]
+        p_out = export_price[t]
+        spread = p_out - p_in
 
-    # SoC dynamics
-    for t in range(Q):
-        row = np.zeros(n_vars)
-        row[2 * Q + (t + 1)] = 1
-        row[2 * Q + t] = -1
-        row[t] = eta_ch
-        row[Q + t] = -(1.0 / eta_dis)
-        A_eq.append(row)
-        b_eq.append(0)
+        # 1) Discharge if it's clearly profitable and SoC is above safety floor
+        if spread > spread_threshold and soc > soc_min_allowed:
+            # Max discharge such that we stay above soc_min_allowed
+            # SoC change per kWh discharge: ΔSoC = (1/eta_dis)*E
+            max_e_dis_by_soc = (soc - soc_min_allowed) * eta_dis
+            max_e_dis = min(emax_dis, max_e_dis_by_soc)
+            if max_e_dis > 0:
+                e_dis[t] = max_e_dis
 
-    # Inequality: soc[Q] ≥ socT → -soc[Q] ≤ -socT
-    A_ub = []
-    b_ub = []
+        # 2) Charge if cheap or we still need SoC to reach target
+        # Recompute soc_min_allowed after potential discharge
+        soc_after_dis = soc - (1.0 / eta_dis) * e_dis[t]
 
-    row = np.zeros(n_vars)
-    row[2 * Q + Q] = -1
-    A_ub.append(row)
-    b_ub.append(-socT)
+        need_soc = soc_after_dis < soc_target  # below target
+        is_cheap = p_in <= cheap_threshold
 
-    # Convert lists to arrays
-    A_eq = np.array(A_eq)
-    b_eq = np.array(b_eq)
-    A_ub = np.array(A_ub)
-    b_ub = np.array(b_ub)
+        if (need_soc or is_cheap) and soc_after_dis < battery_kwh:
+            max_e_ch_by_soc = (battery_kwh - soc_after_dis) / eta_ch
+            max_e_ch = min(emax_ch, max_e_ch_by_soc)
+            if max_e_ch > 0:
+                e_ch[t] = max_e_ch
 
-    # Solve LP
-    res = linprog(
-        c,
-        A_ub=A_ub,
-        b_ub=b_ub,
-        A_eq=A_eq,
-        b_eq=b_eq,
-        bounds=bounds,
-        method="highs",
-    )
+        # Update SoC for next step
+        soc = soc_after_dis + eta_ch * e_ch[t]
 
-    if not res.success:
-        raise ValueError(f"V2G LP infeasible: {res.message}")
+    # ---------- SECOND PASS: ensure final SoC ≥ target ----------
+    # If still below target, we try to add extra charging where possible (even if not cheap).
+    if soc < soc_target - 1e-6:
+        # Re-simulate and adjust charging upwards where we have headroom.
+        soc = soc0
+        for t in range(Q):
+            if not available_mask[t]:
+                # No EV, SoC only affected by previous decisions
+                soc_next = soc
+            else:
+                # Apply existing decisions
+                soc_next = soc - (1.0 / eta_dis) * e_dis[t] + eta_ch * e_ch[t]
 
-    return float(res.fun)
+                if soc_next < soc_target and e_ch[t] < emax_ch:
+                    # Try to add extra charging at this slot
+                    max_extra_power = emax_ch - e_ch[t]
+                    max_extra_by_cap = 0.0
+                    if soc_next < battery_kwh:
+                        max_extra_by_cap = (battery_kwh - soc_next) / eta_ch
+
+                    extra = min(max_extra_power, max_extra_by_cap)
+                    if extra > 0:
+                        e_ch[t] += extra
+                        soc_next = soc - (1.0 / eta_dis) * e_dis[t] + eta_ch * e_ch[t]
+
+            soc = soc_next
+
+        if soc < soc_target - 1e-6:
+            # Even after forcing extra charge, we cannot meet target
+            raise ValueError("V2G: could not reach target SoC given constraints.")
+
+    # ---------- COST CALCULATION ----------
+    cost = float(np.sum(import_price * e_ch - export_price * e_dis))
+    return cost
+
 
 
 # =============================================================================
