@@ -1302,75 +1302,127 @@ if enable_mod3 and grid_fee_series is not None and selected_dso is not None:
     )
     st.table(df_mod3)
 # -----------------------------
-# V2G DAILY PROFILE PLOT
+# ENHANCED V2G DAILY PROFILE PLOT (3-panel diagnostic)
 # -----------------------------
 if enable_v2g and v2g_profile_data is not None:
+
     example_day_idx, time_hours, e_ch_kW, e_dis_kW, soc_ex = v2g_profile_data
 
-    st.markdown("### 🔍 V2G Daily Profile (Example Day)")
+    st.markdown("### 🔍 Enhanced V2G Daily Profile — Charge/Discharge, SoC, and Price")
+    st.markdown(f"*Example day: **{example_day_idx + 1}** of the simulation year*")
 
-    # Pretty label for the example day (1-based)
-    st.markdown(f"*Showing first charging day: day **{example_day_idx + 1}** in the year*")
-
+    # Create 3-row subplot
     fig_v2g = make_subplots(
-        specs=[[{"secondary_y": True}]],
-        subplot_titles=["SoC and Charging/Discharging Power over the Day"],
+        rows=3,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.06,
+        subplot_titles=(
+            "Charging & Discharging Power (kW)",
+            "State of Charge (kWh)",
+            "Import Price (€/kWh)"
+        )
     )
 
-    # Bars for power (kW): charge positive, discharge negative
+    # ---------------------------------------------------------
+    # 1. SHADED REGIONS FOR EV CONNECTED TIME (across all panels)
+    # ---------------------------------------------------------
+    for t in range(96):
+        # Only shade where EV is connected (quarters comes from main model)
+        if t in quarters:
+            start = t / 4
+            end = (t + 1) / 4
+            fig_v2g.add_vrect(
+                x0=start, x1=end,
+                fillcolor="rgba(0,150,255,0.10)",
+                line_width=0,
+                row="all", col=1
+            )
+
+    # ---------------------------------------------------------
+    # 2. PANEL 1 – Charge & Discharge Power
+    # ---------------------------------------------------------
     fig_v2g.add_trace(
         go.Bar(
             x=time_hours,
             y=e_ch_kW,
-            name="Charge power (kW)",
-            opacity=0.7,
+            name="Charge (kW)",
+            marker_color="#4DA3FF",
+            opacity=0.9
         ),
-        secondary_y=False,
+        row=1, col=1
     )
+
     fig_v2g.add_trace(
         go.Bar(
             x=time_hours,
             y=-e_dis_kW,
-            name="Discharge power (kW)",
-            opacity=0.7,
+            name="Discharge (kW)",
+            marker_color="#FF6A6A",
+            opacity=0.9
         ),
-        secondary_y=False,
+        row=1, col=1
     )
 
-    # SoC line (kWh)
+    fig_v2g.update_yaxes(title_text="Power (kW)", row=1, col=1)
+
+    # ---------------------------------------------------------
+    # 3. PANEL 2 – SoC (kWh)
+    # ---------------------------------------------------------
     fig_v2g.add_trace(
         go.Scatter(
             x=time_hours,
-            y=soc_ex[:-1],  # SoC at start of each slot
+            y=soc_ex[:-1],
             name="SoC (kWh)",
-            mode="lines+markers",
+            line=dict(color="#FFB070", width=3),
+            mode="lines+markers"
         ),
-        secondary_y=True,
+        row=2, col=1
+    )
+    fig_v2g.update_yaxes(title_text="SoC (kWh)", row=2, col=1)
+
+    # ---------------------------------------------------------
+    # 4. PANEL 3 – Import Price (€/kWh)
+    # ---------------------------------------------------------
+
+    # Compute €/kWh import price curve for the example day
+    import_price_ex = apply_tariffs(
+        (eff_ex / 1000.0),
+        grid_q_ex,
+        taxes,
+        vat
     )
 
+    fig_v2g.add_trace(
+        go.Scatter(
+            x=time_hours,
+            y=import_price_ex,
+            name="Import Price (€/kWh)",
+            line=dict(color="#00FFAA", width=2),
+        ),
+        row=3, col=1
+    )
+    fig_v2g.update_yaxes(title_text="€/kWh", row=3, col=1)
+
+    # ---------------------------------------------------------
+    # Layout
+    # ---------------------------------------------------------
     fig_v2g.update_layout(
-        height=500,
+        barmode="relative",
+        height=900,
+        showlegend=True,
         plot_bgcolor="#020617",
         paper_bgcolor="rgba(0,0,0,0)",
         font=dict(color="#e5e7eb"),
-        barmode="relative",
-        xaxis_title="Time of day (h)",
         legend=dict(orientation="h", y=-0.2),
-    )
-
-    fig_v2g.update_xaxes(showgrid=False)
-    fig_v2g.update_yaxes(
-        title_text="Power (kW)",
-        secondary_y=False,
-        gridcolor="rgba(148,163,184,0.3)",
-    )
-    fig_v2g.update_yaxes(
-        title_text="SoC (kWh)",
-        secondary_y=True,
-        gridcolor="rgba(148,163,184,0.0)",
+        xaxis3_title="Time of Day (hours)",
     )
 
     st.plotly_chart(fig_v2g, use_container_width=True)
+
+elif enable_v2g:
+    st.warning("⚠️ V2G enabled, but profile data could not be generated.")
+
 
 # =============================================================================
 # AIX ASSISTANT — MODEL-AWARE ENGINE (FIXED & IMPROVED FOR GROQ)
