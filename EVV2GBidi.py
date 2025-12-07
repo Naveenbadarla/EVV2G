@@ -3,6 +3,7 @@ import pandas as pd
 import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import datetime
 import base64
 
@@ -616,6 +617,7 @@ def compute_v2g_daily_cost(
     vat,
     quarters,
     export_factor=1.0,
+    return_profile=False,
 ):
     """
     Balanced, solver-free V2G optimiser (no pulp / scipy needed).
@@ -628,7 +630,10 @@ def compute_v2g_daily_cost(
         * discharges when prices are high enough (spread > threshold)
         * always respects SoC bounds and ability to reach target
 
-    Returns: total net cost for that day (€/day)
+    If return_profile=False  -> returns: cost (float, €/day)
+    If return_profile=True   -> returns: (cost, e_ch, e_dis, soc_series)
+        e_ch, e_dis: kWh per 15-min slot (length Q)
+        soc_series: SoC in kWh at each node (length Q+1)
     """
 
     wholesale_q = np.array(wholesale_q, dtype=float)
@@ -661,6 +666,11 @@ def compute_v2g_daily_cost(
 
     if n_avail == 0:
         # No time to do anything → just hold SoC, cost 0
+        if return_profile:
+            soc_series = np.full(Q + 1, soc0)
+            e_ch = np.zeros(Q)
+            e_dis = np.zeros(Q)
+            return 0.0, e_ch, e_dis, soc_series
         return 0.0
 
     # Power → kWh per quarter
@@ -696,7 +706,6 @@ def compute_v2g_daily_cost(
     # ---------- FORWARD PASS: main heuristic ----------
     for t in range(Q):
         if not available_mask[t]:
-            # No EV connected → nothing happens
             continue
 
         # How many slots left including t?
@@ -716,15 +725,12 @@ def compute_v2g_daily_cost(
 
         # 1) Discharge if it's clearly profitable and SoC is above safety floor
         if spread > spread_threshold and soc > soc_min_allowed:
-            # Max discharge such that we stay above soc_min_allowed
-            # SoC change per kWh discharge: ΔSoC = (1/eta_dis)*E
             max_e_dis_by_soc = (soc - soc_min_allowed) * eta_dis
             max_e_dis = min(emax_dis, max_e_dis_by_soc)
             if max_e_dis > 0:
                 e_dis[t] = max_e_dis
 
         # 2) Charge if cheap or we still need SoC to reach target
-        # Recompute soc_min_allowed after potential discharge
         soc_after_dis = soc - (1.0 / eta_dis) * e_dis[t]
 
         need_soc = soc_after_dis < soc_target  # below target
@@ -740,39 +746,44 @@ def compute_v2g_daily_cost(
         soc = soc_after_dis + eta_ch * e_ch[t]
 
     # ---------- SECOND PASS: ensure final SoC ≥ target ----------
-    # If still below target, we try to add extra charging where possible (even if not cheap).
+    soc = soc0
+    for t in range(Q):
+        if not available_mask[t]:
+            soc_next = soc
+        else:
+            soc_next = soc - (1.0 / eta_dis) * e_dis[t] + eta_ch * e_ch[t]
+
+            if soc_next < soc_target and e_ch[t] < emax_ch:
+                max_extra_power = emax_ch - e_ch[t]
+                max_extra_by_cap = 0.0
+                if soc_next < battery_kwh:
+                    max_extra_by_cap = (battery_kwh - soc_next) / eta_ch
+
+                extra = min(max_extra_power, max_extra_by_cap)
+                if extra > 0:
+                    e_ch[t] += extra
+                    soc_next = soc - (1.0 / eta_dis) * e_dis[t] + eta_ch * e_ch[t]
+
+        soc = soc_next
+
     if soc < soc_target - 1e-6:
-        # Re-simulate and adjust charging upwards where we have headroom.
-        soc = soc0
-        for t in range(Q):
-            if not available_mask[t]:
-                # No EV, SoC only affected by previous decisions
-                soc_next = soc
-            else:
-                # Apply existing decisions
-                soc_next = soc - (1.0 / eta_dis) * e_dis[t] + eta_ch * e_ch[t]
+        raise ValueError("V2G: could not reach target SoC given constraints.")
 
-                if soc_next < soc_target and e_ch[t] < emax_ch:
-                    # Try to add extra charging at this slot
-                    max_extra_power = emax_ch - e_ch[t]
-                    max_extra_by_cap = 0.0
-                    if soc_next < battery_kwh:
-                        max_extra_by_cap = (battery_kwh - soc_next) / eta_ch
-
-                    extra = min(max_extra_power, max_extra_by_cap)
-                    if extra > 0:
-                        e_ch[t] += extra
-                        soc_next = soc - (1.0 / eta_dis) * e_dis[t] + eta_ch * e_ch[t]
-
-            soc = soc_next
-
-        if soc < soc_target - 1e-6:
-            # Even after forcing extra charge, we cannot meet target
-            raise ValueError("V2G: could not reach target SoC given constraints.")
+    # ---------- FINAL SOC SERIES ----------
+    soc_series = np.zeros(Q + 1, dtype=float)
+    soc_series[0] = soc0
+    soc = soc0
+    for t in range(Q):
+        soc = soc - (1.0 / eta_dis) * e_dis[t] + eta_ch * e_ch[t]
+        soc_series[t + 1] = soc
 
     # ---------- COST CALCULATION ----------
     cost = float(np.sum(import_price * e_ch - export_price * e_dis))
+
+    if return_profile:
+        return cost, e_ch, e_dis, soc_series
     return cost
+
 
 
 
@@ -1151,6 +1162,56 @@ try:
 
 except ValueError as e:
     st.error(str(e))
+# =============================================================================
+# V2G DAILY PROFILE (for visual inspection)
+# =============================================================================
+v2g_profile_data = None  # (day_idx, time_hours, e_ch_kW, e_dis_kW, soc_series)
+
+if enable_v2g and charging_days:
+    try:
+        # Use the FIRST charging day as example
+        example_day = int(charging_days[0])
+
+        da_day_ex = da_year[example_day * 24 : (example_day + 1) * 24]
+        id_day_ex = id_year[example_day * 96 : (example_day + 1) * 96]
+        da_q_ex = np.repeat(da_day_ex, 4)
+        eff_ex = np.minimum(da_q_ex, id_day_ex)
+
+        # Choose grid fee for that day (Modul 3 if active & valid, else flat grid)
+        if enable_mod3 and grid_fee_series is not None and selected_dso is not None and is_mod3_valid_day(example_day, selected_dso):
+            grid_q_ex = grid_fee_series[example_day * 96 : (example_day + 1) * 96]
+        else:
+            grid_q_ex = np.full(96, grid)
+
+        # Compute detailed profile
+        cost_ex, e_ch_ex, e_dis_ex, soc_ex = compute_v2g_daily_cost(
+            battery_kwh=battery_capacity,
+            soc_start_pct=soc_start_pct,
+            soc_target_pct=soc_target_pct,
+            soc_min_pct=soc_min_pct,
+            p_charge_max=power,
+            p_discharge_max=p_discharge_max,
+            eta_ch=eta_ch,
+            eta_dis=eta_dis,
+            wholesale_q=eff_ex,
+            grid_q=grid_q_ex,
+            taxes=taxes,
+            vat=vat,
+            quarters=quarters,
+            export_factor=export_factor,
+            return_profile=True,
+        )
+
+        # Convert energy (kWh per 15-min) to power (kW) for plotting
+        e_ch_kW = e_ch_ex * 4.0
+        e_dis_kW = e_dis_ex * 4.0
+
+        time_hours = np.arange(96) / 4.0  # 0..24h in 0.25h steps
+
+        v2g_profile_data = (example_day, time_hours, e_ch_kW, e_dis_kW, soc_ex)
+
+    except Exception as e:
+        st.warning(f'Could not generate V2G daily profile: {e}')
 
 # =============================================================================
 # RESULTS – 3 BLOCKS + BAR CHARTS
@@ -1384,6 +1445,76 @@ def aix_answer(user_message):
         xaxis_title="Customer Type",
     )
     st.plotly_chart(fig_savings, use_container_width=True)
+# -----------------------------
+# V2G DAILY PROFILE PLOT
+# -----------------------------
+if enable_v2g and v2g_profile_data is not None:
+    example_day_idx, time_hours, e_ch_kW, e_dis_kW, soc_ex = v2g_profile_data
+
+    st.markdown("### 🔍 V2G Daily Profile (Example Day)")
+
+    # Pretty label for the example day (1-based)
+    st.markdown(f"*Showing first charging day: day **{example_day_idx + 1}** in the year*")
+
+    fig_v2g = make_subplots(
+        specs=[[{"secondary_y": True}]],
+        subplot_titles=["SoC and Charging/Discharging Power over the Day"],
+    )
+
+    # Bars for power (kW): charge positive, discharge negative
+    fig_v2g.add_trace(
+        go.Bar(
+            x=time_hours,
+            y=e_ch_kW,
+            name="Charge power (kW)",
+            opacity=0.7,
+        ),
+        secondary_y=False,
+    )
+    fig_v2g.add_trace(
+        go.Bar(
+            x=time_hours,
+            y=-e_dis_kW,
+            name="Discharge power (kW)",
+            opacity=0.7,
+        ),
+        secondary_y=False,
+    )
+
+    # SoC line (kWh)
+    fig_v2g.add_trace(
+        go.Scatter(
+            x=time_hours,
+            y=soc_ex[:-1],  # SoC at start of each slot
+            name="SoC (kWh)",
+            mode="lines+markers",
+        ),
+        secondary_y=True,
+    )
+
+    fig_v2g.update_layout(
+        height=500,
+        plot_bgcolor="#020617",
+        paper_bgcolor="rgba(0,0,0,0)",
+        font=dict(color="#e5e7eb"),
+        barmode="relative",
+        xaxis_title="Time of day (h)",
+        legend=dict(orientation="h", y=-0.2),
+    )
+
+    fig_v2g.update_xaxes(showgrid=False)
+    fig_v2g.update_yaxes(
+        title_text="Power (kW)",
+        secondary_y=False,
+        gridcolor="rgba(148,163,184,0.3)",
+    )
+    fig_v2g.update_yaxes(
+        title_text="SoC (kWh)",
+        secondary_y=True,
+        gridcolor="rgba(148,163,184,0.0)",
+    )
+
+    st.plotly_chart(fig_v2g, use_container_width=True)
 
 st.markdown("</div>", unsafe_allow_html=True)
 
