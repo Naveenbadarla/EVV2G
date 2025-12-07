@@ -1301,6 +1301,76 @@ if enable_mod3 and grid_fee_series is not None and selected_dso is not None:
         }
     )
     st.table(df_mod3)
+# -----------------------------
+# V2G DAILY PROFILE PLOT
+# -----------------------------
+if enable_v2g and v2g_profile_data is not None:
+    example_day_idx, time_hours, e_ch_kW, e_dis_kW, soc_ex = v2g_profile_data
+
+    st.markdown("### 🔍 V2G Daily Profile (Example Day)")
+
+    # Pretty label for the example day (1-based)
+    st.markdown(f"*Showing first charging day: day **{example_day_idx + 1}** in the year*")
+
+    fig_v2g = make_subplots(
+        specs=[[{"secondary_y": True}]],
+        subplot_titles=["SoC and Charging/Discharging Power over the Day"],
+    )
+
+    # Bars for power (kW): charge positive, discharge negative
+    fig_v2g.add_trace(
+        go.Bar(
+            x=time_hours,
+            y=e_ch_kW,
+            name="Charge power (kW)",
+            opacity=0.7,
+        ),
+        secondary_y=False,
+    )
+    fig_v2g.add_trace(
+        go.Bar(
+            x=time_hours,
+            y=-e_dis_kW,
+            name="Discharge power (kW)",
+            opacity=0.7,
+        ),
+        secondary_y=False,
+    )
+
+    # SoC line (kWh)
+    fig_v2g.add_trace(
+        go.Scatter(
+            x=time_hours,
+            y=soc_ex[:-1],  # SoC at start of each slot
+            name="SoC (kWh)",
+            mode="lines+markers",
+        ),
+        secondary_y=True,
+    )
+
+    fig_v2g.update_layout(
+        height=500,
+        plot_bgcolor="#020617",
+        paper_bgcolor="rgba(0,0,0,0)",
+        font=dict(color="#e5e7eb"),
+        barmode="relative",
+        xaxis_title="Time of day (h)",
+        legend=dict(orientation="h", y=-0.2),
+    )
+
+    fig_v2g.update_xaxes(showgrid=False)
+    fig_v2g.update_yaxes(
+        title_text="Power (kW)",
+        secondary_y=False,
+        gridcolor="rgba(148,163,184,0.3)",
+    )
+    fig_v2g.update_yaxes(
+        title_text="SoC (kWh)",
+        secondary_y=True,
+        gridcolor="rgba(148,163,184,0.0)",
+    )
+
+    st.plotly_chart(fig_v2g, use_container_width=True)
 
 # =============================================================================
 # AIX ASSISTANT — MODEL-AWARE ENGINE (FIXED & IMPROVED FOR GROQ)
@@ -1445,76 +1515,7 @@ def aix_answer(user_message):
         xaxis_title="Customer Type",
     )
     st.plotly_chart(fig_savings, use_container_width=True)
-# -----------------------------
-# V2G DAILY PROFILE PLOT
-# -----------------------------
-if enable_v2g and v2g_profile_data is not None:
-    example_day_idx, time_hours, e_ch_kW, e_dis_kW, soc_ex = v2g_profile_data
 
-    st.markdown("### 🔍 V2G Daily Profile (Example Day)")
-
-    # Pretty label for the example day (1-based)
-    st.markdown(f"*Showing first charging day: day **{example_day_idx + 1}** in the year*")
-
-    fig_v2g = make_subplots(
-        specs=[[{"secondary_y": True}]],
-        subplot_titles=["SoC and Charging/Discharging Power over the Day"],
-    )
-
-    # Bars for power (kW): charge positive, discharge negative
-    fig_v2g.add_trace(
-        go.Bar(
-            x=time_hours,
-            y=e_ch_kW,
-            name="Charge power (kW)",
-            opacity=0.7,
-        ),
-        secondary_y=False,
-    )
-    fig_v2g.add_trace(
-        go.Bar(
-            x=time_hours,
-            y=-e_dis_kW,
-            name="Discharge power (kW)",
-            opacity=0.7,
-        ),
-        secondary_y=False,
-    )
-
-    # SoC line (kWh)
-    fig_v2g.add_trace(
-        go.Scatter(
-            x=time_hours,
-            y=soc_ex[:-1],  # SoC at start of each slot
-            name="SoC (kWh)",
-            mode="lines+markers",
-        ),
-        secondary_y=True,
-    )
-
-    fig_v2g.update_layout(
-        height=500,
-        plot_bgcolor="#020617",
-        paper_bgcolor="rgba(0,0,0,0)",
-        font=dict(color="#e5e7eb"),
-        barmode="relative",
-        xaxis_title="Time of day (h)",
-        legend=dict(orientation="h", y=-0.2),
-    )
-
-    fig_v2g.update_xaxes(showgrid=False)
-    fig_v2g.update_yaxes(
-        title_text="Power (kW)",
-        secondary_y=False,
-        gridcolor="rgba(148,163,184,0.3)",
-    )
-    fig_v2g.update_yaxes(
-        title_text="SoC (kWh)",
-        secondary_y=True,
-        gridcolor="rgba(148,163,184,0.0)",
-    )
-
-    st.plotly_chart(fig_v2g, use_container_width=True)
 
 st.markdown("</div>", unsafe_allow_html=True)
 
