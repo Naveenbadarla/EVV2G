@@ -5,7 +5,8 @@ import plotly.express as px
 import plotly.graph_objects as go
 import datetime
 import base64
-import pulp
+from scipy.optimize import linprog
+
 
 # =============================================================================
 # PAGE CONFIG
@@ -617,86 +618,123 @@ def compute_v2g_daily_cost(
     export_factor=1.0,
 ):
     """
-    Single-day V2G optimisation:
-    - 15-min resolution
-    - SoC-based, with charge & discharge decisions
-    - Objective: minimise net cost = imports - exports
+    V2G daily optimisation using scipy.optimize.linprog
+    Decision variables:
+        x = [e_ch[0..Q-1], e_dis[0..Q-1], soc[0..Q]]
     """
-    wholesale_q = np.array(wholesale_q, dtype=float)
-    grid_q = np.array(grid_q, dtype=float)
+
+    import numpy as np
+
     Q = len(wholesale_q)
 
-    # Convert SoC to kWh
-    soc_start = battery_kwh * soc_start_pct / 100.0
-    soc_target = battery_kwh * soc_target_pct / 100.0
-    soc_min = battery_kwh * soc_min_pct / 100.0
+    wholesale_kwh = np.array(wholesale_q) / 1000.0
+    grid_q = np.array(grid_q)
 
-    if soc_start_pct < soc_min_pct:
-        raise ValueError("Arrival SoC (%) must be ≥ minimum SoC (%).")
-    if soc_target_pct < soc_min_pct:
-        raise ValueError("Target SoC (%) must be ≥ minimum SoC (%).")
+    # Price vectors
+    import_price = apply_tariffs(wholesale_kwh, grid_q, taxes, vat)
+    export_price = export_factor * wholesale_kwh
 
-    # Wholesale to €/kWh
-    wholesale_kwh = wholesale_q / 1000.0
+    # Convert SoC inputs
+    soc0 = battery_kwh * soc_start_pct / 100
+    socT = battery_kwh * soc_target_pct / 100
+    soc_min = battery_kwh * soc_min_pct / 100
 
-    # Import + export prices per quarter
-    import_price = apply_tariffs(wholesale_kwh, grid_q, taxes, vat)  # €/kWh
-    export_price = export_factor * wholesale_kwh                     # €/kWh
+    # Variable vector length:
+    # e_ch[0..Q-1], e_dis[0..Q-1], soc[0..Q]
+    n_vars = Q + Q + (Q + 1)
 
-    # LP model
-    model = pulp.LpProblem("V2G_Optimisation", pulp.LpMinimize)
+    # Objective function coefficients
+    c = np.zeros(n_vars)
 
-    # Decision variables
-    e_ch = pulp.LpVariable.dicts("charge", range(Q), lowBound=0)   # kWh
-    e_dis = pulp.LpVariable.dicts("discharge", range(Q), lowBound=0)  # kWh
-    soc = pulp.LpVariable.dicts(
-        "soc",
-        range(Q + 1),
-        lowBound=soc_min,
-        upBound=battery_kwh,
-    )
+    # e_ch part → positive cost (import)
+    for t in range(Q):
+        c[t] = import_price[t]
 
-    # Initial SoC
-    model += soc[0] == soc_start
+    # e_dis part → negative cost (revenue)
+    for t in range(Q):
+        c[Q + t] = -export_price[t]
 
-    # Power → energy per quarter
+    # soc variables → no direct cost
+    # (already zero)
+
+    # Bounds
+    bounds = []
+
+    # Charging limits
     emax_ch = p_charge_max * 0.25
     emax_dis = p_discharge_max * 0.25
+    quarters_set = set(quarters)
 
-    available_set = set(quarters)
-
+    # e_ch bounds
     for t in range(Q):
-        # Power limits
-        model += e_ch[t] <= emax_ch
-        model += e_dis[t] <= emax_dis
+        if t in quarters_set:
+            bounds.append((0, emax_ch))
+        else:
+            bounds.append((0, 0))
 
-        # Only allow charge/discharge when EV is present
-        if t not in available_set:
-            model += e_ch[t] == 0
-            model += e_dis[t] == 0
+    # e_dis bounds
+    for t in range(Q):
+        if t in quarters_set:
+            bounds.append((0, emax_dis))
+        else:
+            bounds.append((0, 0))
 
-        # SoC dynamics
-        model += soc[t + 1] == soc[t] + eta_ch * e_ch[t] - (1.0 / eta_dis) * e_dis[t]
+    # SoC bounds
+    for t in range(Q + 1):
+        bounds.append((soc_min, battery_kwh))
 
-    # Final SoC requirement
-    model += soc[Q] >= soc_target
+    # Constraints
+    A_eq = []
+    b_eq = []
 
-    # Objective: minimise import cost - export revenue
-    cost = pulp.lpSum(
-        import_price[t] * e_ch[t] - export_price[t] * e_dis[t]
-        for t in range(Q)
+    # Initial SoC constraint
+    row = np.zeros(n_vars)
+    soc_index_0 = 2 * Q + 0
+    row[soc_index_0] = 1
+    A_eq.append(row)
+    b_eq.append(soc0)
+
+    # SoC dynamics
+    for t in range(Q):
+        row = np.zeros(n_vars)
+        row[2 * Q + (t + 1)] = 1
+        row[2 * Q + t] = -1
+        row[t] = eta_ch
+        row[Q + t] = -(1.0 / eta_dis)
+        A_eq.append(row)
+        b_eq.append(0)
+
+    # Inequality: soc[Q] ≥ socT → -soc[Q] ≤ -socT
+    A_ub = []
+    b_ub = []
+
+    row = np.zeros(n_vars)
+    row[2 * Q + Q] = -1
+    A_ub.append(row)
+    b_ub.append(-socT)
+
+    # Convert lists to arrays
+    A_eq = np.array(A_eq)
+    b_eq = np.array(b_eq)
+    A_ub = np.array(A_ub)
+    b_ub = np.array(b_ub)
+
+    # Solve LP
+    res = linprog(
+        c,
+        A_ub=A_ub,
+        b_ub=b_ub,
+        A_eq=A_eq,
+        b_eq=b_eq,
+        bounds=bounds,
+        method="highs",
     )
-    model += cost
 
-    # Solve
-    solver = pulp.PULP_CBC_CMD(msg=False)
-    model.solve(solver)
+    if not res.success:
+        raise ValueError(f"V2G LP infeasible: {res.message}")
 
-    status = pulp.LpStatus[model.status]
-    if status != "Optimal":
-        raise ValueError(f"V2G optimisation infeasible or not optimal (status: {status}).")
+    return float(res.fun)
 
-    return float(pulp.value(model.objective))
 
 # =============================================================================
 # FILE LOADER
