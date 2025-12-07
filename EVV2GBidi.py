@@ -656,7 +656,7 @@ def compute_v2g_daily_cost(
     # Prices in €/kWh
     wholesale_kwh = wholesale_q / 1000.0
     import_price = apply_tariffs(wholesale_kwh, grid_q, taxes, vat)
-    export_price = export_factor * wholesale_kwh
+    export_price = wholesale_kwh + grid_q
 
     # Availability mask
     quarters_set = set(quarters)
